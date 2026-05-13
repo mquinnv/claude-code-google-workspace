@@ -2,6 +2,14 @@
 
 This documents the full investigation — what we tried, what failed, what we learned, and why the final solution looks the way it does. Written March 2026.
 
+> **Update (May 2026):** Two of the conclusions in these notes have since been superseded.
+>
+> 1. **`gws mcp` removed in v0.8.0** — the CLI's MCP server mode was deleted in [PR #275](https://github.com/googleworkspace/cli/pull/275). The setup now requires pinning to `@googleworkspace/cli@0.7.0`. There's no detailed rationale in the changelog beyond "BREAKING CHANGE: Remove MCP server mode".
+>
+> 2. **The "mint-token-via-wrapper" approach has been replaced.** That approach worked but expired after 1 hour, requiring a Claude Code restart — fatal for Claude Desktop. The new architecture uses per-account isolated config dirs with `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` + `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file`, so `gws mcp` can refresh tokens internally with no expiry. See [manual-setup.md](manual-setup.md) for the current procedure.
+>
+> The rest of this document — the gotchas, the OAuth-client-per-account rule, the `.mcp.json` placement rules, the Claude Desktop built-in connector behavior — still applies.
+
 ## The Starting Point
 
 **Goal:** Give Claude Code access to Gmail, Google Drive, Calendar, Sheets, and Docs — for multiple Google accounts (personal + work). Also Slack.

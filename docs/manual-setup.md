@@ -1,25 +1,33 @@
 # Manual Setup Guide
 
-Step-by-step instructions for setting up Google Workspace + Slack MCP servers in Claude Code without AI assistance.
+Step-by-step instructions for setting up Google Workspace + Slack MCP servers in Claude Code AND Claude Desktop without AI assistance.
 
 ## Google Workspace MCP
 
-### 1. Install the Google Workspace CLI
+### 1. Install the Google Workspace CLI (pinned to 0.7.0)
 
 ```bash
-npm install -g @googleworkspace/cli
-gws --version  # should be 0.7+
+# If Homebrew's git-workspace `gws` is installed, uninstall it first:
+brew uninstall gws 2>/dev/null
+
+npm install -g @googleworkspace/cli@0.7.0
+gws --version  # must be 0.7.x
 ```
+
+**Why pinned:** `gws mcp` was removed in v0.8.0 (PR #275). 0.7.0 is the last version with the MCP subcommand. Do NOT `npm update` this package.
 
 ### 2. Create a GCP Project
 
-1. Go to https://console.cloud.google.com/projectcreate
+1. Go to https://console.cloud.google.com/projectcreate (signed in with the account that should OWN the project — personal Gmail is usually cleanest)
 2. Name it something like `gws-mcp` (project ID must be globally unique)
 3. Note the project ID
 
 ### 3. Enable APIs
 
 ```bash
+# If gcloud isn't logged in as the project owner:
+gcloud auth login OWNER_EMAIL
+
 gcloud services enable \
   gmail.googleapis.com \
   drive.googleapis.com \
@@ -29,7 +37,18 @@ gcloud services enable \
   --project=YOUR_PROJECT_ID
 ```
 
-### 4. Configure OAuth Consent Screen
+### 4. Grant API access to other accounts (if any)
+
+For each non-owner account that will use this project:
+
+```bash
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
+  --member="user:OTHER_EMAIL" \
+  --role="roles/serviceusage.serviceUsageConsumer" \
+  --condition=None
+```
+
+### 5. Configure OAuth Consent Screen
 
 1. Go to: `https://console.cloud.google.com/apis/credentials/consent?project=YOUR_PROJECT_ID`
 2. Select **External** user type
@@ -41,7 +60,7 @@ gcloud services enable \
 5. **Add test users**: Add **every Google account** you want to connect
 6. Save
 
-### 5. Create OAuth Desktop Client(s)
+### 6. Create OAuth Desktop Client(s)
 
 Go to: `https://console.cloud.google.com/apis/credentials?project=YOUR_PROJECT_ID`
 
@@ -52,50 +71,56 @@ Go to: `https://console.cloud.google.com/apis/credentials?project=YOUR_PROJECT_I
 3. Name: something descriptive (e.g., "MCP - personal", "MCP - work")
 4. Click "Create"
 5. Download the JSON file
-6. Save it:
-   ```bash
-   mkdir -p ~/.config/gws
-   # Move the downloaded file:
-   mv ~/Downloads/client_secret_*.json ~/.config/gws/client_secret_ACCOUNTNAME.json
-   ```
+6. We'll place each file into its account's isolated config directory next.
 
 **Why separate clients?** Using the same OAuth client ID for two Google accounts causes the second login to invalidate the first account's refresh token. This is an OAuth2 behavior, not a bug.
 
-### 6. Authenticate Each Account
+### 7. Set up per-account isolated config directories
 
-For each account (e.g., "personal" and "work"):
+For each account (e.g., `personal`, `work`):
 
 ```bash
-# Set this account's client secret as active
-cp ~/.config/gws/client_secret_personal.json ~/.config/gws/client_secret.json
+mkdir -p ~/.config/gws/accounts/personal
+mkdir -p ~/.config/gws/accounts/work
 
-# Login — browser will open, sign in with the CORRECT Google account
-gws auth login -s drive,gmail,calendar,sheets,docs
-
-# Export the credentials (includes refresh token)
-gws auth export --unmasked > ~/.config/gws/personal.json
+# Move each downloaded OAuth client file into its account dir, renamed:
+mv ~/Downloads/<personal-client>.json ~/.config/gws/accounts/personal/client_secret.json
+mv ~/Downloads/<work-client>.json    ~/.config/gws/accounts/work/client_secret.json
 ```
 
-Repeat for each additional account, swapping the client secret file each time.
+**Why isolated dirs?** The `gws` CLI defaults to the system keyring, which only stores credentials for one account at a time. Without isolation, the last login wins for every account. We give each account its own `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` and use `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file` so credentials live in a per-account `credentials.enc` that `gws mcp` can decrypt and refresh internally.
 
-### 7. Install the Token Wrapper
+### 8. Authenticate Each Account
+
+For each account, run:
+
+```bash
+env GOOGLE_WORKSPACE_CLI_CONFIG_DIR=$HOME/.config/gws/accounts/personal \
+    GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file \
+    gws auth login -s drive,gmail,calendar,sheets,docs
+# Browser opens — sign in as the personal account
+```
+
+Repeat for `work` (and any other accounts), substituting the dir.
+
+**Verify** each account routes correctly:
+
+```bash
+env GOOGLE_WORKSPACE_CLI_CONFIG_DIR=$HOME/.config/gws/accounts/personal \
+    GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file \
+    gws drive about get --params '{"fields":"user(emailAddress)"}'
+```
+
+The returned email should match the account you authenticated with.
+
+### 9. Install the Launcher Script
 
 ```bash
 cp scripts/gws-token-wrapper.sh ~/.config/gws/gws-token-wrapper.sh
 chmod +x ~/.config/gws/gws-token-wrapper.sh
 ```
 
-**What this does:** The `gws` CLI can only hold one account's credentials at a time. The wrapper script reads the exported credential file, mints a fresh OAuth access token using the refresh token, and passes it to `gws mcp` via the `GOOGLE_WORKSPACE_CLI_TOKEN` environment variable (the highest-priority auth method).
-
-### 8. If Using a Second Account from a Different Google Workspace Domain
-
-The GCP project owner's account works automatically. For accounts on other domains (e.g., a work Google Workspace), you need to grant API access:
-
-```bash
-gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="user:you@workdomain.com" \
-  --role="roles/serviceusage.serviceUsageConsumer"
-```
+**What it does:** Thin shim that sets `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` + `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file` and execs `gws mcp`. `gws mcp` then refreshes access tokens from the per-account `credentials.enc` as needed — no 1-hour expiry.
 
 ---
 
@@ -137,11 +162,24 @@ Go to "OAuth & Permissions" → "User Token Scopes" → Add these scopes:
 
 ---
 
-## Configure Claude Code
+## Configure Claude Code / Claude Desktop
 
-### Create `.mcp.json`
+You have three places to register MCP servers, pick whichever fits:
 
-In the root of the project where you want these MCP servers available, create `.mcp.json`:
+### Option A: Claude Code user scope (available in all projects)
+
+```bash
+claude mcp add --scope user gws-personal -- \
+  $HOME/.config/gws/gws-token-wrapper.sh \
+  $HOME/.config/gws/accounts/personal \
+  -s gmail,drive,calendar,sheets,docs
+```
+
+Note the `--` separator so `claude mcp add` doesn't try to parse `-s` as its own scope flag.
+
+Repeat for `gws-work` etc.
+
+### Option B: Claude Code project scope (`.mcp.json` at project root)
 
 ```json
 {
@@ -149,14 +187,14 @@ In the root of the project where you want these MCP servers available, create `.
     "gws-personal": {
       "command": "/Users/YOUR_USERNAME/.config/gws/gws-token-wrapper.sh",
       "args": [
-        "/Users/YOUR_USERNAME/.config/gws/personal.json",
+        "/Users/YOUR_USERNAME/.config/gws/accounts/personal",
         "-s", "gmail,drive,calendar,sheets,docs"
       ]
     },
     "gws-work": {
       "command": "/Users/YOUR_USERNAME/.config/gws/gws-token-wrapper.sh",
       "args": [
-        "/Users/YOUR_USERNAME/.config/gws/work.json",
+        "/Users/YOUR_USERNAME/.config/gws/accounts/work",
         "-s", "gmail,drive,calendar,sheets,docs"
       ]
     },
@@ -171,67 +209,70 @@ In the root of the project where you want these MCP servers available, create `.
 }
 ```
 
-Replace paths and tokens with your actual values.
+Replace `YOUR_USERNAME` with your actual home dir.
 
-### Global Setup (Optional)
+### Option C: Claude Desktop / Cowork
 
-To make these available in ALL projects, add the `mcpServers` config to `~/.claude.json` instead.
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` — add an `mcpServers` block at the top level with the same shape as Option B.
+
+**Important:** Claude Desktop ships with built-in `claude.ai` connectors for Gmail, Google Drive, and Google Calendar. They are **read-only**. The model may pick those over our write-capable `gws-*` MCPs. Go to Settings → Connectors and disable the built-in Google connectors.
 
 ### Gitignore
 
-**`.mcp.json` contains tokens — never commit it.**
+If using `.mcp.json` in a real project, add it to `.gitignore`. (The new architecture doesn't put OAuth secrets in `.mcp.json` directly — they live in `~/.config/gws/accounts/*/credentials.enc` — but the per-account dir paths can still leak environment info.)
 
-```bash
-echo ".mcp.json" >> .gitignore
-```
+### Restart Claude Code / Claude Desktop
 
-### Restart Claude Code
-
-MCP servers only load at session launch. You must restart after creating/editing `.mcp.json`.
+MCP servers only load at session launch.
 
 ---
 
 ## Verify It Works
 
-After restarting Claude Code, test each server:
+After restarting:
 
 ```
 # Gmail — list recent emails
-ToolSearch: "+gws gmail messages list"
 mcp__gws-personal__gmail_users_messages_list(params: {"userId": "me", "maxResults": 3})
 
 # Drive — search files
-ToolSearch: "+gws drive files"
-mcp__gws-personal__drive_files_list(params: {"q": "modifiedTime > '2024-01-01'", "pageSize": 5})
+mcp__gws-personal__drive_files_list(params: {"q": "modifiedTime > '2024-01-01'", "pageSize": 5, "fields": "files(id,name)"})
 
 # Slack — list channels
-ToolSearch: "+slack channels"
 mcp__slack__channels_list(channel_types: "public_channel")
 ```
 
-If tools don't appear in ToolSearch, check:
+If tools don't appear:
 1. `.mcp.json` is at the project root (not inside `.claude/`)
-2. You restarted Claude Code after creating it
-3. The wrapper script is executable (`chmod +x`)
-4. Credential files exist at the paths specified
+2. You restarted Claude Code / Claude Desktop
+3. Wrapper script is executable (`chmod +x`)
+4. Account dirs exist with both `client_secret.json` AND `credentials.enc`
 
 ---
 
 ## Troubleshooting
 
-See the [README](../README.md#known-gotchas) for a full list of known gotchas.
+See the [README](../README.md#known-gotchas) for a full table.
 
 ### Common Issues
 
+**"Unknown service 'mcp'" when wrapper runs:**
+→ `gws` is on a version ≥ 0.8.0. Pin to 0.7.0: `npm install -g @googleworkspace/cli@0.7.0 --force`.
+
+**Wrong account's data returned:**
+→ Each account needs its OWN `~/.config/gws/accounts/<name>/` dir, authenticated via `gws auth login` with `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` + `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file`. If accounts share a dir or rely on the system keyring, the last login wins for everyone.
+
+**"Invalid authentication credentials" after some time (especially Claude Desktop):**
+→ This was a problem with the old "mint-once-at-startup" wrapper. The new architecture lets `gws mcp` refresh tokens internally, so this should not recur. If it does, verify `credentials.enc` exists in the account dir and re-run the Step 8 login command if needed.
+
 **"Access blocked" during OAuth login:**
-→ Add the Google account as a test user on the OAuth consent screen
-
-**Wrong account's emails showing up:**
-→ Each account needs its own OAuth client ID. Check that `client_id` differs between credential files.
-
-**MCP servers not starting (no error):**
-→ `mcpServers` in `settings.local.json` is silently ignored. Must be in `.mcp.json` (project root) or `~/.claude.json` (global).
+→ Add the Google account as a test user on the OAuth consent screen (Step 5).
 
 **API calls fail with "permission denied":**
-→ For work accounts on a different domain, grant IAM access (see Step 8 above).
-→ Also check: `gcloud auth application-default set-quota-project YOUR_PROJECT_ID`
+→ For work accounts on a different domain, grant IAM access (Step 4).
+
+**MCP servers not starting (no error):**
+→ For Claude Code: `mcpServers` in `settings.local.json` is silently ignored. Use `.mcp.json` (project root), `~/.claude.json` (global via `claude mcp add --scope user`), or `claude_desktop_config.json` for Claude Desktop.
+
+**Claude Desktop says "I don't have write access" despite write scopes:**
+→ Settings → Connectors → disable the built-in Gmail/Drive/Calendar (claude.ai-managed, read-only).
