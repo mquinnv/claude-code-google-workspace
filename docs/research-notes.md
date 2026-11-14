@@ -117,13 +117,15 @@ The `settings.json` and `settings.local.json` files accept the `mcpServers` key 
 
 **Fix:** Specify only the scopes you need: `-s drive,gmail,calendar,sheets,docs` (~10 scopes total). The `gws` CLI maps these short names to the actual OAuth scope URLs.
 
+**Update (November 2026):** the `-s` shorthand maps to more than the services you name — see Problem 9. Log in with `--scopes` and explicit scope URLs instead.
+
 ## Problem 5: "Access Blocked" for Work Accounts
 
 **What happened:** OAuth flow worked for the personal Google account (which owned the GCP project) but showed "Access blocked" for the work Google Workspace account.
 
 **Two fixes needed:**
 
-1. **Add as test user:** On the OAuth consent screen in GCP, add the work email as a test user. Unverified apps only allow explicitly listed test users.
+1. **Add as test user:** On the OAuth consent screen in GCP, add the work email as a test user. Apps in "Testing" only allow explicitly listed test users. (Staying in Testing has a cost we found much later — see Problem 8.)
 
 2. **Grant IAM access:** The work account needs permission to use the GCP project's APIs:
    ```bash
@@ -152,6 +154,40 @@ The `settings.json` and `settings.local.json` files accept the `mcpServers` key 
 **What happened:** `gws auth login` opens the default/foreground browser. If you have multiple Chrome profiles, it may open the wrong one, authenticating the wrong Google account.
 
 **Fix:** Before running `gws auth login`, bring the correct Chrome profile window to the foreground. There's no `--browser` or `--profile` flag — the CLI uses the OS default browser handler.
+
+## Problem 8: Every Account Needs Re-Login After 7 Days (Consent Screen in "Testing")
+
+*Found November 2026, months after the original setup.*
+
+**What happened:** All accounts stopped working roughly a week after each login. Re-running `gws auth login` fixed it for another week. The per-account-dir architecture was refreshing access tokens correctly; it was the refresh tokens themselves that were dying.
+
+**How we confirmed it:** We called Google's token endpoint with each account's refresh token. Every response carried `refresh_token_expires_in` of about 604,400 seconds — just under 7 days.
+
+**Root cause:** Google's OAuth docs list it under [refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration): a project whose consent screen is External with publishing status "Testing" is issued refresh tokens that expire in 7 days. The earlier version of this guide told readers to stay in Testing and add test users (Problem 5), so everyone who followed it hits this.
+
+**Fix:** Google Auth Platform → Audience → **Publish app** (status "In production"). No verification was submitted. Things we ran into:
+
+1. **Publish is greyed out** until Branding has a home page link, privacy policy link and terms of service link, plus an authorized domain matching them.
+2. **Old tokens keep their expiry.** Tokens issued while in Testing still expire at 7 days; each account needs one fresh login after publishing. After that login, `refresh_token_expires_in` is absent from the token response for all three accounts we tested and Gmail `getProfile` still works.
+3. **One Workspace account got "This app is blocked"** after publishing. That org restricts unverified third-party apps; marking the account's OAuth client ID as Trusted in the Admin console (Security → Access and data control → API controls → Manage app access) fixed it. A personal Gmail account and a second Workspace org only showed the "Google hasn't verified this app" warning, which can be clicked through.
+
+## Problem 9: `gws auth login -s ...` Also Requests the `cloud-platform` Scope
+
+*Found November 2026 while investigating Problem 8.*
+
+**What happened:** After `gws auth login -s drive,gmail,calendar,sheets,docs` on `gws` 0.7.0, `gws auth status` lists `https://www.googleapis.com/auth/cloud-platform` among the granted scopes. Nothing in this setup needs it.
+
+**Why it matters:** Google documents that tokens carrying the Cloud Platform scope are subject to a Workspace organisation's "Google Cloud session control" policy, which forces reauthentication on an admin-set interval of 1–24 hours. **We did not confirm this was expiring our tokens** — the 7-day Testing expiry (Problem 8) explains everything we observed. It is a risk we removed, not a failure we diagnosed.
+
+**Fix:** Log in with explicit scope URLs:
+
+```bash
+gws auth login --scopes "openid,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/gmail.modify,https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/calendar,https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/documents"
+```
+
+With `--scopes`, neither the consent URL nor the resulting token includes `cloud-platform`. `scripts/reauth.sh` wraps this for every account dir. The `-s gmail,drive,...` argument to `gws mcp` is a different thing (it selects which services' tools the server exposes) and is unchanged.
+
+**Related upstream issues:** [googleworkspace/cli#562](https://github.com/googleworkspace/cli/issues/562), [#741](https://github.com/googleworkspace/cli/issues/741), [#918](https://github.com/googleworkspace/cli/issues/918).
 
 ## What We Evaluated But Didn't Use
 

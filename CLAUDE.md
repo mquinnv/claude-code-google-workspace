@@ -22,6 +22,7 @@ Do not restate or re-derive the setup procedure here. Read it from the repo:
 | Ranked "Known Gotchas" table (symptom → fix, ordered by time cost) | `README.md` |
 | Why the architecture is what it is, and every approach that failed | `docs/research-notes.md` |
 | The launcher script the setup installs | `scripts/gws-token-wrapper.sh` |
+| The login / re-login script (all accounts, explicit scopes) | `scripts/reauth.sh` |
 
 `docs/manual-setup.md` is the procedure of record. This file holds only the invariants and hard
 constraints you must not violate while following it.
@@ -43,8 +44,20 @@ slow-to-diagnose failure — see `docs/research-notes.md` for the debugging sess
 4. **The launcher is a thin shim.** `scripts/gws-token-wrapper.sh` validates the account dir, sets
    those two env vars, and `exec`s `gws mcp`. It does not mint or cache tokens itself. An earlier
    design that minted a token once at startup died after an hour and must not be reintroduced.
-5. **Request a narrow scope set** — `gmail,drive,calendar,sheets,docs`. Asking for everything makes
-   Google block the unverified app at the consent screen.
+5. **Request a narrow scope set, as explicit scope URLs.** Log in with
+   `gws auth login --scopes <comma-separated full scope URLs>` (the list is in `scripts/reauth.sh`
+   and Step 8 of `docs/manual-setup.md`). Asking for everything makes Google block the unverified
+   app at the consent screen. Do not use `gws auth login -s drive,gmail,...`: on 0.7.0 that
+   shorthand also requests `cloud-platform`, which exposes Workspace accounts to Google Cloud
+   session-control reauth. The `-s gmail,drive,calendar,sheets,docs` passed to `gws mcp` selects
+   services, not OAuth scopes — leave it alone.
+6. **The OAuth app must be published to production, not left in "Testing".** Google expires
+   refresh tokens issued to a Testing app after 7 days, so every account would need a weekly
+   browser login. Publishing needs the Branding links and an authorized domain filled in first,
+   needs no verification, and tokens issued before publishing keep their 7-day expiry — one fresh
+   login per account afterwards. A Workspace org that restricts unverified apps then shows "This
+   app is blocked" until an admin marks the OAuth client ID as Trusted. Procedure:
+   `docs/manual-setup.md`, Step 5.
 
 ## Registering the server with your agent
 
@@ -85,7 +98,8 @@ See `docs/manual-setup.md` for fully worked examples of each, plus the Slack ser
 4. **One OAuth client and one config dir per account** — invariants 1 and 2 above. Sharing either
    is the root cause of "wrong account's data returned".
 5. **MCP servers start only at session launch.** After any config change, restart the agent.
-6. **`gws` uses single-dash flags** — `-s drive`, not `--scope drive`.
+6. **`gws` uses single-dash short flags for services** — `-s drive`, not `--scope drive`. The one
+   long flag this setup relies on is `gws auth login --scopes` (invariant 5).
 7. **When registering through a CLI, separate its flags from the wrapper's.** If the outer command
    would swallow the inner `-s`, use a `--` separator (e.g. `claude mcp add NAME -- WRAPPER DIR -s ...`).
 8. **Built-in Google connectors can shadow these servers.** If your client ships its own Gmail /
@@ -98,8 +112,13 @@ See `docs/manual-setup.md` for fully worked examples of each, plus the Slack ser
 
 ## Re-authentication
 
-If credentials are revoked or scopes need re-granting, re-run the Step 8 login for that account
-(`docs/manual-setup.md`). No restart is needed unless the MCP process itself has crashed.
+If credentials are revoked or scopes need re-granting, run `~/.config/gws/reauth.sh` (installed
+from `scripts/reauth.sh`; `--force` re-does every account), or re-run the Step 8 login for that
+account by hand (`docs/manual-setup.md`). No restart is needed unless the MCP process itself has
+crashed.
+
+If re-authentication is needed about every 7 days, do not just re-login: the OAuth app is still in
+Testing (invariant 6). Publish it, then log in once more per account.
 
 ## Operational details
 

@@ -57,8 +57,20 @@ gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
    - User support email: your email
    - Developer contact: your email
 4. Skip scopes (they're requested at login time)
-5. **Add test users**: Add **every Google account** you want to connect
+5. **Add test users**: Add **every Google account** you want to connect (only needed while the app is in Testing)
 6. Save
+7. **Publish the app** — do not leave it in Testing. See below.
+
+#### Publish to production (or re-authenticate every 7 days)
+
+A new External app starts with publishing status **Testing**. Google expires refresh tokens issued to a Testing app after **7 days** ([OAuth docs, "Refresh token expiration"](https://developers.google.com/identity/protocols/oauth2#expiration)). The symptom is every account failing with an auth error about a week after login, and again a week after each re-login. You can see it directly: while the app is in Testing, the token endpoint's response to a refresh carries `refresh_token_expires_in` of roughly 604,800 seconds (7 days); after publishing and logging in again the field is absent.
+
+Fix: Google Auth Platform → **Audience** → **Publish app** (status becomes "In production"). You do **not** need to submit the app for verification for personal use.
+
+- **The Publish button is greyed out until Branding is complete.** Under Google Auth Platform → **Branding**, fill in the application home page, privacy policy link and terms of service link, and add an authorized domain that matches those links.
+- **Unverified-app warning.** With no verification submitted, sign-in shows "Google hasn't verified this app". Click Advanced → continue. This is expected.
+- **Google Workspace accounts may be blocked.** If a Workspace account gets "This app is blocked" after publishing, that organisation restricts unverified third-party apps. A Workspace admin must mark that account's OAuth client ID as **Trusted** in the Admin console: Security → Access and data control → API controls → Manage app access. Personal Gmail accounts, and Workspace orgs without that restriction, only show the unverified-app warning.
+- **Log in once more after publishing.** Tokens issued while the app was in Testing keep their 7-day expiry. Re-run the Step 8 login (or `reauth.sh --force`) for every account after you publish.
 
 ### 6. Create OAuth Desktop Client(s)
 
@@ -97,11 +109,15 @@ For each account, run:
 ```bash
 env GOOGLE_WORKSPACE_CLI_CONFIG_DIR=$HOME/.config/gws/accounts/personal \
     GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file \
-    gws auth login -s drive,gmail,calendar,sheets,docs
+    gws auth login --scopes "openid,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/gmail.modify,https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/calendar,https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/documents"
 # Browser opens — sign in as the personal account
 ```
 
-Repeat for `work` (and any other accounts), substituting the dir.
+Repeat for `work` (and any other accounts), substituting the dir. Or let `scripts/reauth.sh` do it: it walks every dir under `~/.config/gws/accounts/` and runs this same login for each account that is not currently authenticated (see Step 9).
+
+**Why `--scopes` with full URLs instead of `-s drive,gmail,...`?** On `gws` 0.7.0 the `-s` service shorthand also requests `https://www.googleapis.com/auth/cloud-platform` (visible in `gws auth status` afterwards). Google documents that tokens carrying the Cloud Platform scope are subject to a Workspace org's "Google Cloud session control" reauthentication policy (1–24 hours, admin-configured), which would force re-login far more often than the token lifetime suggests. The explicit `--scopes` list requests exactly the scopes above and nothing else. We have not confirmed session control was expiring tokens in practice — treat it as a risk worth removing, not a diagnosed failure. Related `gws` issues: [googleworkspace/cli#562](https://github.com/googleworkspace/cli/issues/562), [#741](https://github.com/googleworkspace/cli/issues/741), [#918](https://github.com/googleworkspace/cli/issues/918).
+
+This applies to **`gws auth login` only**. The `-s gmail,drive,calendar,sheets,docs` argument passed to `gws mcp` in the server definitions below selects which services' tools to expose; it is not an OAuth scope request and stays as it is.
 
 **Verify** each account routes correctly:
 
@@ -113,14 +129,16 @@ env GOOGLE_WORKSPACE_CLI_CONFIG_DIR=$HOME/.config/gws/accounts/personal \
 
 The returned email should match the account you authenticated with.
 
-### 9. Install the Launcher Script
+### 9. Install the Launcher and Re-auth Scripts
 
 ```bash
-cp scripts/gws-token-wrapper.sh ~/.config/gws/gws-token-wrapper.sh
-chmod +x ~/.config/gws/gws-token-wrapper.sh
+cp scripts/gws-token-wrapper.sh scripts/reauth.sh ~/.config/gws/
+chmod +x ~/.config/gws/gws-token-wrapper.sh ~/.config/gws/reauth.sh
 ```
 
 **What it does:** Thin shim that sets `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` + `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file` and execs `gws mcp`. `gws mcp` then refreshes access tokens from the per-account `credentials.enc` as needed — no 1-hour expiry.
+
+**`reauth.sh`:** checks every account under `~/.config/gws/accounts/` and runs the Step 8 login only for the ones whose credentials no longer work (`--force` re-does all of them). You should rarely need it once the app is published (Step 5).
 
 ---
 
@@ -260,13 +278,19 @@ See the [README](../README.md#known-gotchas) for a full table.
 → `gws` is on a version ≥ 0.8.0. Pin to 0.7.0: `npm install -g @googleworkspace/cli@0.7.0 --force`.
 
 **Wrong account's data returned:**
-→ Each account needs its OWN `~/.config/gws/accounts/<name>/` dir, authenticated via `gws auth login` with `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` + `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file`. If accounts share a dir or rely on the system keyring, the last login wins for everyone.
+→ Each account needs its OWN `~/.config/gws/accounts/<name>/` dir, authenticated via the Step 8 `gws auth login` command with `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` + `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file`. If accounts share a dir or rely on the system keyring, the last login wins for everyone.
 
-**"Invalid authentication credentials" after some time (especially Claude Desktop):**
-→ This was a problem with the old "mint-once-at-startup" wrapper. The new architecture lets `gws mcp` refresh tokens internally, so this should not recur. If it does, verify `credentials.enc` exists in the account dir and re-run the Step 8 login command if needed.
+**Every account stops working about 7 days after login (auth errors, `invalid_grant`):**
+→ The OAuth consent screen is still in Testing, which caps refresh tokens at 7 days. Publish the app (Step 5, "Publish to production"), then run `~/.config/gws/reauth.sh --force` once.
+
+**"Invalid authentication credentials" after about an hour (especially Claude Desktop):**
+→ This was a problem with the old "mint-once-at-startup" wrapper. The new architecture lets `gws mcp` refresh tokens internally, so this should not recur. If it does, verify `credentials.enc` exists in the account dir and run `~/.config/gws/reauth.sh`.
 
 **"Access blocked" during OAuth login:**
-→ Add the Google account as a test user on the OAuth consent screen (Step 5).
+→ While the app is in Testing: add the Google account as a test user on the OAuth consent screen (Step 5).
+
+**"This app is blocked" for a Workspace account after publishing:**
+→ A Workspace admin must mark that account's OAuth client ID as Trusted (Admin console → Security → Access and data control → API controls → Manage app access). See Step 5.
 
 **API calls fail with "permission denied":**
 → For work accounts on a different domain, grant IAM access (Step 4).

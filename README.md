@@ -20,9 +20,11 @@ It's not one problem — it's a stack of them, each undocumented:
 
 4. **The credential file env var doesn't work — and neither does the system keyring for multi-account.** `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` doesn't reliably route to the right account. The system keyring (`gws` default) only stores credentials for one account at a time — the last `gws auth login` wins for everyone. The fix is per-account isolated config directories with `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` + `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file`, so each account has its own encrypted credential store and `gws mcp` can refresh tokens internally with no 1-hour expiry.
 
-4. **Go binaries use single-dash flags.** Both the `gws` CLI and [`slack-mcp-server`](https://github.com/nichochar/slack-mcp-server) are Go binaries. `--transport stdio` fails silently. It's `-t stdio` — or just omit it (stdio is the default).
+5. **Refresh tokens die after 7 days if the OAuth app stays in "Testing".** Google expires refresh tokens issued to an External app whose publishing status is Testing after 7 days, so every account needs a fresh browser login each week. Publishing the app to production (no verification needed for personal use) removes the expiry. See [docs/manual-setup.md, Step 5](docs/manual-setup.md#publish-to-production-or-re-authenticate-every-7-days).
 
-5. **MCP servers only start at session launch.** Config changes don't take effect until you restart Claude Code entirely.
+6. **Go binaries use single-dash flags.** Both the `gws` CLI and [`slack-mcp-server`](https://github.com/nichochar/slack-mcp-server) are Go binaries. `--transport stdio` fails silently. It's `-t stdio` — or just omit it (stdio is the default).
+
+7. **MCP servers only start at session launch.** Config changes don't take effect until you restart Claude Code entirely.
 
 Each of these individually cost 30-120 minutes to diagnose. Together they make the setup feel broken when it's actually a solvable configuration problem.
 
@@ -39,6 +41,8 @@ Each of these individually cost 30-120 minutes to diagnose. Together they make t
 | `mcpServers` in `.claude/settings.json` | Also silently ignored |
 | Service account auth | Can't access personal Gmail/Drive without domain-wide delegation |
 | Requesting all 85+ OAuth scopes | Google blocks unverified apps requesting too many scopes |
+| Leaving the OAuth consent screen in "Testing" | Refresh tokens expire after 7 days — weekly re-login for every account |
+| `gws auth login -s drive,gmail,...` (service shorthand) | Also requests the `cloud-platform` scope, which exposes Workspace accounts to Google Cloud session-control reauth; use explicit `--scopes` URLs |
 
 For the full investigation log, see [docs/research-notes.md](docs/research-notes.md).
 
@@ -50,6 +54,8 @@ The working setup uses:
 - **Separate OAuth Desktop clients** — one per Google account, in the same GCP project
 - **Per-account isolated config directories** — each at `~/.config/gws/accounts/<account>/` with its own `client_secret.json` and file-backed encrypted credential store, via `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` + `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file`. This lets `gws mcp` refresh access tokens internally — no 1-hour expiry issue.
 - **A thin launcher script** — sets the env vars and execs `gws mcp` against the right account dir
+- **An OAuth app published to production** — not left in Testing, where refresh tokens expire every 7 days
+- **Explicit OAuth scopes at login** — `gws auth login --scopes <full scope URLs>`, wrapped by `scripts/reauth.sh`, so the token does not pick up the `cloud-platform` scope
 - **`.mcp.json` at project root** (or user-scope via `claude mcp add --scope user`, or `~/Library/Application Support/Claude/claude_desktop_config.json` for Claude Desktop)
 - **[slack-mcp-server](https://github.com/nichochar/slack-mcp-server)** — Go-based Slack MCP, read-only by default
 
@@ -158,14 +164,17 @@ These are ordered by how much time they'll cost you if you hit them unaware:
 | 3 | `gws mcp` removed in v0.8.0 | 30 min | `Unknown service 'mcp'` from `gws mcp ...` on any current install | Pin to 0.7.0: `npm install -g @googleworkspace/cli@0.7.0` |
 | 4 | System keyring stores only one account's creds | 1 hour | Same data returned for every account, regardless of which MCP is invoked | Use per-account `CONFIG_DIR` + `KEYRING_BACKEND=file` (isolated encrypted credential stores) |
 | 5 | Mint-one-shot token approach dies after 1hr | 1 hour | API calls work briefly, then fail with "invalid authentication credentials" — fatal in long-running Claude Desktop | Use the per-account-dir architecture so `gws mcp` can refresh tokens itself |
-| 6 | Work account shows "Access blocked" | 30 min | OAuth consent screen blocks non-test users | Add all accounts as test users on OAuth consent screen + grant IAM `serviceUsageConsumer` role |
+| 6 | Work account shows "Access blocked" | 30 min | OAuth consent screen blocks non-test users | While in Testing: add all accounts as test users on OAuth consent screen. Always: grant IAM `serviceUsageConsumer` role |
+| 6a | OAuth app left in "Testing" | recurring, weekly | Every account fails with auth errors ~7 days after login; re-login fixes it for another 7 days | Google Auth Platform → Audience → **Publish app** (needs Branding links + authorized domain first), then log in once more per account. [Details](docs/manual-setup.md#publish-to-production-or-re-authenticate-every-7-days) |
+| 6b | Workspace account shows "This app is blocked" after publishing | 15 min | Org restricts unverified third-party apps | Workspace admin marks the OAuth client ID as Trusted: Admin console → Security → Access and data control → API controls → Manage app access |
 | 7 | Claude Desktop built-in Google connectors are read-only | 30 min | "I don't have write access" even with our MCPs configured | Settings → Connectors → disable the built-in Gmail/Drive/Calendar |
 | 8 | MCP servers only start at session launch | 15 min | Config changes don't take effect | Restart Claude Code / Claude Desktop after MCP config changes |
 | 9 | Go binaries use single-dash flags | 15 min | `--transport stdio` fails silently | Use `-t stdio` or omit (stdio is default) |
 | 10 | `claude mcp add` collides with inner `-s` flag | 10 min | "Invalid scope" error from `claude mcp add` | Use `--` separator: `claude mcp add NAME -- WRAPPER ARGS -s scopes` |
 | 11 | Homebrew `gws` package collides on binary | 10 min | `gws` is on PATH but it's the "git workspace" tool, not Google | `brew uninstall gws` before `npm install -g @googleworkspace/cli@0.7.0` |
 | 12 | `gws auth login` opens foreground browser | 5 min | Wrong Chrome profile = wrong account authenticated | Bring correct Chrome profile to front before running |
-| 13 | Too many OAuth scopes requested | 10 min | Google blocks unverified app | Use `-s drive,gmail,calendar,sheets,docs` (not all scopes) |
+| 13 | Too many OAuth scopes requested | 10 min | Google blocks unverified app | Request only what you need, as explicit URLs: `gws auth login --scopes ...` (see `scripts/reauth.sh`) |
+| 13a | `gws auth login -s ...` adds the `cloud-platform` scope | unknown (risk, not an observed failure) | `gws auth status` lists `https://www.googleapis.com/auth/cloud-platform`; Workspace orgs can force reauth every 1–24h on such tokens | Log in with `--scopes` and full scope URLs instead of `-s`. `-s` on `gws mcp` is unaffected |
 | 14 | `gws auth export` includes "Using keyring backend" prefix line | 5 min | Exported JSON file unparseable | (No longer relevant — the new architecture doesn't use `gws auth export` at all) |
 
 ## Caveats
@@ -173,6 +182,7 @@ These are ordered by how much time they'll cost you if you hit them unaware:
 - **Tested with `gws` CLI v0.7.0 and current Claude Code / Claude Desktop**. `gws mcp` was removed in v0.8.0 — the setup will not work on newer `gws` until/unless someone ships a replacement standalone Google Workspace MCP server we can switch to.
 - Google and Anthropic will likely make this easier natively — this repo fills the gap until then
 - GCP project + OAuth consent screen setup requires manual browser steps (can't be fully automated)
+- Publishing the OAuth app without verification means the "Google hasn't verified this app" warning at every login, and Workspace orgs that restrict unverified apps need an admin to trust the client ID
 - Tested on macOS — Linux should work, Windows untested
 - The `gws` CLI is pre-1.0 — flags and auth behavior may change again
 
